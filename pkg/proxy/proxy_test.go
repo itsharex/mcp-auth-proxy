@@ -70,7 +70,7 @@ func TestProxyRouter_HandleProxy_ValidToken(t *testing.T) {
 	proxyHeaders := make(http.Header)
 	proxyHeaders.Set("X-Forwarded-By", "mcp-auth-proxy")
 
-	proxyRouter, err := NewProxyRouter("https://example.com", proxyHandler, publicKey, proxyHeaders, false, nil)
+	proxyRouter, err := NewProxyRouter("https://example.com", proxyHandler, publicKey, proxyHeaders, false, nil, "/userinfo")
 	require.NoError(t, err)
 
 	gin.SetMode(gin.TestMode)
@@ -163,7 +163,7 @@ func TestProxyRouter_HeaderMapping(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			})
 
-			proxyRouter, err := NewProxyRouter("https://example.com", proxyHandler, publicKey, http.Header{}, false, tt.headerMapping)
+			proxyRouter, err := NewProxyRouter("https://example.com", proxyHandler, publicKey, http.Header{}, false, tt.headerMapping, "/userinfo")
 			require.NoError(t, err)
 
 			gin.SetMode(gin.TestMode)
@@ -197,11 +197,135 @@ func TestProxyRouter_HeaderMapping(t *testing.T) {
 	}
 }
 
+func TestProxyRouter_HeaderMappingBase(t *testing.T) {
+	privateKey, publicKey, err := generateRSAKeyPair()
+	require.NoError(t, err)
+
+	cases := []struct {
+		name              string
+		headerMapping     map[string]string
+		headerMappingBase string
+		claims            jwt.MapClaims
+		expectedHeaders   map[string]string
+		missingHeaders    []string
+	}{
+		{
+			name:              "base=/ reads top-level claims",
+			headerMapping:     map[string]string{"/email": "X-Forwarded-Email"},
+			headerMappingBase: "/",
+			claims: jwt.MapClaims{
+				"sub":   "test-user",
+				"email": "user@example.com",
+				"exp":   time.Now().Add(time.Hour).Unix(),
+				"iat":   time.Now().Unix(),
+			},
+			expectedHeaders: map[string]string{
+				"X-Forwarded-Email": "user@example.com",
+			},
+		},
+		{
+			name:              "base=/userinfo reads userinfo claims",
+			headerMapping:     map[string]string{"/email": "X-Forwarded-Email"},
+			headerMappingBase: "/userinfo",
+			claims: jwt.MapClaims{
+				"sub":      "test-user",
+				"email":    "toplevel@example.com",
+				"userinfo": map[string]any{"email": "userinfo@example.com"},
+				"exp":      time.Now().Add(time.Hour).Unix(),
+				"iat":      time.Now().Unix(),
+			},
+			expectedHeaders: map[string]string{
+				"X-Forwarded-Email": "userinfo@example.com",
+			},
+		},
+		{
+			name:              "base=/ with multiple claims",
+			headerMapping:     map[string]string{"/email": "X-Forwarded-Email", "/name": "X-Forwarded-Name"},
+			headerMappingBase: "/",
+			claims: jwt.MapClaims{
+				"sub":   "test-user",
+				"email": "user@example.com",
+				"name":  "John Doe",
+				"exp":   time.Now().Add(time.Hour).Unix(),
+				"iat":   time.Now().Unix(),
+			},
+			expectedHeaders: map[string]string{
+				"X-Forwarded-Email": "user@example.com",
+				"X-Forwarded-Name":  "John Doe",
+			},
+		},
+		{
+			name:              "base=/userinfo skips when userinfo is absent",
+			headerMapping:     map[string]string{"/email": "X-Forwarded-Email"},
+			headerMappingBase: "/userinfo",
+			claims: jwt.MapClaims{
+				"sub":   "test-user",
+				"email": "user@example.com",
+				"exp":   time.Now().Add(time.Hour).Unix(),
+				"iat":   time.Now().Unix(),
+			},
+			missingHeaders: []string{"X-Forwarded-Email"},
+		},
+		{
+			name:              "base=/ missing claim is skipped",
+			headerMapping:     map[string]string{"/email": "X-Forwarded-Email", "/missing": "X-Missing"},
+			headerMappingBase: "/",
+			claims: jwt.MapClaims{
+				"sub":   "test-user",
+				"email": "user@example.com",
+				"exp":   time.Now().Add(time.Hour).Unix(),
+				"iat":   time.Now().Unix(),
+			},
+			expectedHeaders: map[string]string{
+				"X-Forwarded-Email": "user@example.com",
+			},
+			missingHeaders: []string{"X-Missing"},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			receivedHeaders := http.Header{}
+			proxyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				for k, v := range r.Header {
+					receivedHeaders[k] = v
+				}
+				w.WriteHeader(http.StatusOK)
+			})
+
+			proxyRouter, err := NewProxyRouter("https://example.com", proxyHandler, publicKey, http.Header{}, false, tt.headerMapping, tt.headerMappingBase)
+			require.NoError(t, err)
+
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			proxyRouter.SetupRoutes(router)
+
+			token, err := createJWT(privateKey, tt.claims)
+			require.NoError(t, err)
+
+			req, err := http.NewRequest("GET", "/test", nil)
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "Bearer "+token)
+
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusOK, w.Code)
+			for header, expected := range tt.expectedHeaders {
+				assert.Equal(t, expected, receivedHeaders.Get(header), "header %s mismatch", header)
+			}
+			for _, header := range tt.missingHeaders {
+				assert.Empty(t, receivedHeaders.Get(header), "header %s should not be set", header)
+			}
+		})
+	}
+}
+
 func TestProxyRouter_ProtectedResourceTrailingSlash(t *testing.T) {
 	_, publicKey, err := generateRSAKeyPair()
 	require.NoError(t, err)
 
-	proxyRouter, err := NewProxyRouter("https://example.com/", http.NotFoundHandler(), publicKey, http.Header{}, false, nil)
+	proxyRouter, err := NewProxyRouter("https://example.com/", http.NotFoundHandler(), publicKey, http.Header{}, false, nil, "/userinfo")
 	require.NoError(t, err)
 
 	gin.SetMode(gin.TestMode)
@@ -305,7 +429,7 @@ func TestProxyRouter_HTTPStreamingOnlyRejectsSSE(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			})
 
-			proxyRouter, err := NewProxyRouter("https://example.com", proxyHandler, publicKey, http.Header{}, tt.streamingOnly, nil)
+			proxyRouter, err := NewProxyRouter("https://example.com", proxyHandler, publicKey, http.Header{}, tt.streamingOnly, nil, "/userinfo")
 			require.NoError(t, err)
 
 			gin.SetMode(gin.TestMode)

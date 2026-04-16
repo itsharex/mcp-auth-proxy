@@ -18,6 +18,7 @@ type ProxyRouter struct {
 	proxyHeaders      http.Header
 	httpStreamingOnly bool
 	headerMapping     map[string]string
+	headerMappingBase string
 }
 
 func NewProxyRouter(
@@ -27,6 +28,7 @@ func NewProxyRouter(
 	proxyHeaders http.Header,
 	httpStreamingOnly bool,
 	headerMapping map[string]string,
+	headerMappingBase string,
 ) (*ProxyRouter, error) {
 	return &ProxyRouter{
 		externalURL:       externalURL,
@@ -35,6 +37,7 @@ func NewProxyRouter(
 		proxyHeaders:      proxyHeaders,
 		httpStreamingOnly: httpStreamingOnly,
 		headerMapping:     headerMapping,
+		headerMappingBase: headerMappingBase,
 	}, nil
 }
 
@@ -93,9 +96,18 @@ func (p *ProxyRouter) handleProxy(c *gin.Context) {
 
 	if len(p.headerMapping) > 0 {
 		if claims, ok := token.Claims.(jwt.MapClaims); ok {
-			if userinfo, exists := claims["userinfo"]; exists {
+			var source any = map[string]any(claims)
+			if p.headerMappingBase != "/" {
+				val, err := jsonpointer.Get(source, p.headerMappingBase)
+				if err != nil {
+					source = nil
+				} else {
+					source = val
+				}
+			}
+			if source != nil {
 				for pointer, headerName := range p.headerMapping {
-					val, err := jsonpointer.Get(userinfo, pointer)
+					val, err := jsonpointer.Get(source, pointer)
 					if err != nil {
 						continue
 					}
